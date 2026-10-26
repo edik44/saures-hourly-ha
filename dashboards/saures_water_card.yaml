@@ -1,0 +1,683 @@
+# Карточка «Вода» для пакета saures-hourly-ha (packages/saures.yaml), версия 1.0.0. Лицензия MIT.
+# Куда: панель -> «Изменить» -> «Добавить карточку» -> «Вручную» -> вставить весь файл.
+# Нужны (HACS, раздел «Интерфейс»): Mushroom 5+ (mushroom-legacy-template-card, chips), ApexCharts card,
+# vertical-stack-in-card, card_mod. Помощники «Тариф воды», «Показывать расход воды в рублях», «Вид графика воды» и
+# скрипты «График воды» и «SAURES синхронизация воды» задаёт сам пакет.
+#   - шапка: «Вода», до какого времени загружены данные и батарея контроллера; значок оранжевый, если данных нет
+#     больше 30 часов;
+#   - плитки: «Вчера» и «За месяц» (м³), «Счётчик» (показание), «Цена за месяц» (₽; нажатие — «Тариф воды»);
+#   - чипы «Час / День / Месяц» (повторное нажатие скрывает график), «₽» (столбцы в рублях), «Обновить» (ручная
+#     синхронизация с подтверждением; синий — идёт синхронизация, красный — последняя закончилась ошибкой);
+#   - «Час» — 7 дней по часам, «День» — 30 дней, «Месяц» — 12 месяцев и серые столбцы «Год назад».
+type: custom:vertical-stack-in-card
+cards:
+  - type: custom:mushroom-legacy-template-card
+    entity: sensor.voda_saures_pokazanie
+    primary: Вода
+    secondary: >-
+      {% set t = as_datetime(states('sensor.voda_saures_raskhod'), none) %}
+      {% set b = states('sensor.voda_saures_batareia') %}
+      {% if t is none %}нет данных{% else %}{% set t = as_local(t) %}{% set d = (now().date() - t.date()).days %}данные на {{ t.strftime('%H:%M') if d == 0 else ('вчера ' ~ t.strftime('%H:%M') if d == 1 else t.strftime('%d.%m %H:%M')) }}{% endif %}{{ (' · батарея ' ~ (b | int(0)) ~ '%') if is_number(b) else '' }}
+    icon: mdi:water-outline
+    icon_color: >-
+      {{ 'orange' if as_timestamp(now()) - as_timestamp(states('sensor.voda_saures_raskhod'), 0) > 30 * 3600 else 'blue' }}
+    tap_action:
+      action: more-info
+    card_mod:
+      style: |
+        ha-card {
+          background:
+            linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)),
+            linear-gradient(135deg,
+              rgba(56, 189, 248, 0.22),
+              rgba(25, 25, 40, 0.10)) !important;
+          border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+          border-radius: 14px;
+          margin: 3px 6px !important;
+          box-shadow:
+            0 5.5px 11px rgba(0, 0, 0, 0.35),
+            0 1.5px 3px rgba(0, 0, 0, 0.28),
+            inset 0 1px 0 rgba(255, 255, 255, 0.20),
+            inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+        }
+  - type: horizontal-stack
+    cards:
+      - type: custom:mushroom-legacy-template-card
+        entity: sensor.voda_saures_vchera
+        primary: >-
+          {% set v = states(entity) %}
+          {{ ('%.2f' | format(v | float(0))) if is_number(v) else '—' }} м³
+        secondary: Вчера
+        icon: mdi:cup-water
+        icon_color: light-blue
+        tap_action:
+          action: more-info
+        card_mod:
+          style: |
+            ha-card {
+              background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+              border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+              border-radius: 14px;
+              margin: 3px -1px 3px 6px !important;
+              box-shadow:
+                0 5.5px 11px rgba(0, 0, 0, 0.35),
+                0 1.5px 3px rgba(0, 0, 0, 0.28),
+                inset 0 1px 0 rgba(255, 255, 255, 0.20),
+                inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            }
+      - type: custom:mushroom-legacy-template-card
+        entity: sensor.voda_saures_za_mesiats
+        primary: >-
+          {% set v = states(entity) %}
+          {{ ('%.2f' | format(v | float(0))) if is_number(v) else '—' }} м³
+        secondary: За месяц
+        icon: mdi:calendar-month-outline
+        icon_color: cyan
+        tap_action:
+          action: more-info
+        card_mod:
+          style: |
+            ha-card {
+              background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+              border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+              border-radius: 14px;
+              margin: 3px 6px 3px -1px !important;
+              box-shadow:
+                0 5.5px 11px rgba(0, 0, 0, 0.35),
+                0 1.5px 3px rgba(0, 0, 0, 0.28),
+                inset 0 1px 0 rgba(255, 255, 255, 0.20),
+                inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            }
+  - type: horizontal-stack
+    cards:
+      - type: custom:mushroom-legacy-template-card
+        entity: sensor.voda_saures_pokazanie
+        primary: >-
+          {% set v = states(entity) %}
+          {{ ('%.3f' | format(v | float(0))) if is_number(v) else '—' }} м³
+        secondary: Счётчик
+        icon: mdi:counter
+        icon_color: indigo
+        tap_action:
+          action: more-info
+        card_mod:
+          style: |
+            ha-card {
+              background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+              border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+              border-radius: 14px;
+              margin: 3px -1px 3px 6px !important;
+              box-shadow:
+                0 5.5px 11px rgba(0, 0, 0, 0.35),
+                0 1.5px 3px rgba(0, 0, 0, 0.28),
+                inset 0 1px 0 rgba(255, 255, 255, 0.20),
+                inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            }
+      - type: custom:mushroom-legacy-template-card
+        entity: sensor.voda_saures_za_mesiats_rub
+        primary: >-
+          {% set v = states(entity) %}
+          {{ ('%.2f' | format(v | float(0))) if is_number(v) else '—' }} ₽
+        secondary: Цена за месяц
+        icon: mdi:cash
+        icon_color: green
+        tap_action:
+          action: more-info
+          entity: input_number.tarif_vody
+        card_mod:
+          style: |
+            ha-card {
+              background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+              border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+              border-radius: 14px;
+              margin: 3px 6px 3px -1px !important;
+              box-shadow:
+                0 5.5px 11px rgba(0, 0, 0, 0.35),
+                0 1.5px 3px rgba(0, 0, 0, 0.28),
+                inset 0 1px 0 rgba(255, 255, 255, 0.20),
+                inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            }
+  - type: custom:mushroom-chips-card
+    alignment: center
+    chips:
+      - type: template
+        icon: mdi:clock-outline
+        icon_color: "{{ 'blue' if is_state('input_select.vid_grafika_vody', 'hour') else 'grey' }}"
+        content: Час
+        tap_action:
+          action: perform-action
+          perform_action: script.grafik_vody
+          data:
+            vid: hour
+      - type: template
+        icon: mdi:calendar-today
+        icon_color: "{{ 'blue' if is_state('input_select.vid_grafika_vody', 'day') else 'grey' }}"
+        content: День
+        tap_action:
+          action: perform-action
+          perform_action: script.grafik_vody
+          data:
+            vid: day
+      - type: template
+        icon: mdi:calendar-month
+        icon_color: "{{ 'blue' if is_state('input_select.vid_grafika_vody', 'month') else 'grey' }}"
+        content: Месяц
+        tap_action:
+          action: perform-action
+          perform_action: script.grafik_vody
+          data:
+            vid: month
+      - type: template
+        icon: mdi:currency-rub
+        icon_color: "{{ 'blue' if is_state('input_boolean.pokazyvat_raskhod_vody_v_rubliakh', 'on') else 'grey' }}"
+        tap_action:
+          action: perform-action
+          perform_action: input_boolean.toggle
+          target:
+            entity_id: input_boolean.pokazyvat_raskhod_vody_v_rubliakh
+      - type: template
+        icon: mdi:cloud-sync-outline
+        icon_color: "{{ 'blue' if is_state('script.saures_sinhronizatsiia', 'on') else 'red' if states('sensor.voda_saures_status').startswith('ошибка') else 'grey' }}"
+        tap_action:
+          action: perform-action
+          perform_action: script.turn_on
+          target:
+            entity_id: script.saures_sinhronizatsiia
+          confirmation:
+            text: >-
+              Получить данные SAURES сейчас? Новые показания приходят раз в сутки, после связи контроллера.
+              Повторный запуск — не раньше чем через 5 минут.
+    card_mod:
+      style: |
+        ha-card {
+          --chip-background: linear-gradient(180deg, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0.04));
+          --chip-border-width: 1.5px;
+          --chip-border-color: rgba(255, 255, 255, 0.16);
+          --chip-box-shadow: 0 4px 8px rgba(0, 0, 0, 0.30), 0 1px 2px rgba(0, 0, 0, 0.24), inset 0 1px 0 rgba(255, 255, 255, 0.20), inset 0 -1px 2px rgba(0, 0, 0, 0.16);
+          padding: 3px 0;
+        }
+  # «Час», м³: последние 7 дней по часам
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.vid_grafika_vody
+        state: hour
+      - condition: state
+        entity: input_boolean.pokazyvat_raskhod_vody_v_rubliakh
+        state_not: 'on'
+    card:
+      type: custom:apexcharts-card
+      experimental:
+        color_threshold: true
+      header:
+        show: false
+      graph_span: 7d
+      span:
+        end: hour
+      series:
+        - entity: sensor.voda_saures_raskhod
+          name: Расход
+          type: column
+          unit: м³
+          float_precision: 2
+          statistics:
+            type: change
+            period: hour
+          color_threshold:
+            - value: 0
+              color: '#7dd3fc'
+            - value: 0.05
+              color: '#38bdf8'
+            - value: 0.1
+              color: '#0ea5e9'
+            - value: 0.2
+              color: '#6366f1'
+      apex_config:
+        noData:
+          text: 'Вода по часам: нет данных синхронизации'
+        chart:
+          height: 160
+          toolbar:
+            show: false
+        tooltip:
+          x:
+            format: dd MMM HH:mm
+        xaxis:
+          type: datetime
+          labels:
+            format: dd MMM
+            style:
+              colors: 'rgba(255, 255, 255, 0.65)'
+              fontSize: '11px'
+        yaxis:
+          - decimalsInFloat: 2
+        grid:
+          show: false
+        legend:
+          show: false
+        dataLabels:
+          enabled: false
+        plotOptions:
+          bar:
+            columnWidth: 90%
+      card_mod:
+        style: |
+          ha-card {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+            border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+            border-radius: 14px;
+            margin: 3px 6px !important;
+            box-shadow:
+              0 5.5px 11px rgba(0, 0, 0, 0.35),
+              0 1.5px 3px rgba(0, 0, 0, 0.28),
+              inset 0 1px 0 rgba(255, 255, 255, 0.20),
+              inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            overflow: hidden;
+          }
+  # «Час», ₽
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.vid_grafika_vody
+        state: hour
+      - condition: state
+        entity: input_boolean.pokazyvat_raskhod_vody_v_rubliakh
+        state: 'on'
+    card:
+      type: custom:apexcharts-card
+      experimental:
+        color_threshold: true
+      header:
+        show: false
+      graph_span: 7d
+      span:
+        end: hour
+      series:
+        - entity: sensor.voda_saures_stoimost
+          name: Расход
+          type: column
+          unit: ₽
+          float_precision: 2
+          statistics:
+            type: change
+            period: hour
+          color_threshold:
+            - value: 0
+              color: '#7dd3fc'
+            - value: 4
+              color: '#38bdf8'
+            - value: 8
+              color: '#0ea5e9'
+            - value: 15
+              color: '#6366f1'
+      apex_config:
+        noData:
+          text: '₽ по часам: нет данных синхронизации'
+        chart:
+          height: 160
+          toolbar:
+            show: false
+        tooltip:
+          x:
+            format: dd MMM HH:mm
+        xaxis:
+          type: datetime
+          labels:
+            format: dd MMM
+            style:
+              colors: 'rgba(255, 255, 255, 0.65)'
+              fontSize: '11px'
+        yaxis:
+          - decimalsInFloat: 0
+        grid:
+          show: false
+        legend:
+          show: false
+        dataLabels:
+          enabled: false
+        plotOptions:
+          bar:
+            columnWidth: 90%
+      card_mod:
+        style: |
+          ha-card {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+            border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+            border-radius: 14px;
+            margin: 3px 6px !important;
+            box-shadow:
+              0 5.5px 11px rgba(0, 0, 0, 0.35),
+              0 1.5px 3px rgba(0, 0, 0, 0.28),
+              inset 0 1px 0 rgba(255, 255, 255, 0.20),
+              inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            overflow: hidden;
+          }
+  # «День», м³: последние 30 дней
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.vid_grafika_vody
+        state: day
+      - condition: state
+        entity: input_boolean.pokazyvat_raskhod_vody_v_rubliakh
+        state_not: 'on'
+    card:
+      type: custom:apexcharts-card
+      experimental:
+        color_threshold: true
+      header:
+        show: false
+      graph_span: 30d
+      span:
+        end: day
+      series:
+        - entity: sensor.voda_saures_raskhod
+          name: Расход
+          type: column
+          unit: м³
+          float_precision: 2
+          statistics:
+            type: change
+            period: day
+          color_threshold:
+            - value: 0
+              color: '#7dd3fc'
+            - value: 0.3
+              color: '#38bdf8'
+            - value: 0.6
+              color: '#0ea5e9'
+            - value: 0.9
+              color: '#6366f1'
+      apex_config:
+        noData:
+          text: 'Вода по дням: нет данных синхронизации'
+        chart:
+          height: 160
+          toolbar:
+            show: false
+        tooltip:
+          x:
+            format: dd MMM
+        xaxis:
+          type: datetime
+          labels:
+            format: dd MMM
+            style:
+              colors: 'rgba(255, 255, 255, 0.65)'
+              fontSize: '11px'
+        yaxis:
+          - decimalsInFloat: 2
+        grid:
+          show: false
+        legend:
+          show: false
+        dataLabels:
+          enabled: false
+        plotOptions:
+          bar:
+            columnWidth: 70%
+      card_mod:
+        style: |
+          ha-card {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+            border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+            border-radius: 14px;
+            margin: 3px 6px !important;
+            box-shadow:
+              0 5.5px 11px rgba(0, 0, 0, 0.35),
+              0 1.5px 3px rgba(0, 0, 0, 0.28),
+              inset 0 1px 0 rgba(255, 255, 255, 0.20),
+              inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            overflow: hidden;
+          }
+  # «День», ₽
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.vid_grafika_vody
+        state: day
+      - condition: state
+        entity: input_boolean.pokazyvat_raskhod_vody_v_rubliakh
+        state: 'on'
+    card:
+      type: custom:apexcharts-card
+      experimental:
+        color_threshold: true
+      header:
+        show: false
+      graph_span: 30d
+      span:
+        end: day
+      series:
+        - entity: sensor.voda_saures_stoimost
+          name: Расход
+          type: column
+          unit: ₽
+          float_precision: 2
+          statistics:
+            type: change
+            period: day
+          color_threshold:
+            - value: 0
+              color: '#7dd3fc'
+            - value: 20
+              color: '#38bdf8'
+            - value: 40
+              color: '#0ea5e9'
+            - value: 60
+              color: '#6366f1'
+      apex_config:
+        noData:
+          text: '₽ по дням: нет данных синхронизации'
+        chart:
+          height: 160
+          toolbar:
+            show: false
+        tooltip:
+          x:
+            format: dd MMM
+        xaxis:
+          type: datetime
+          labels:
+            format: dd MMM
+            style:
+              colors: 'rgba(255, 255, 255, 0.65)'
+              fontSize: '11px'
+        yaxis:
+          - decimalsInFloat: 0
+        grid:
+          show: false
+        legend:
+          show: false
+        dataLabels:
+          enabled: false
+        plotOptions:
+          bar:
+            columnWidth: 70%
+      card_mod:
+        style: |
+          ha-card {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+            border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+            border-radius: 14px;
+            margin: 3px 6px !important;
+            box-shadow:
+              0 5.5px 11px rgba(0, 0, 0, 0.35),
+              0 1.5px 3px rgba(0, 0, 0, 0.28),
+              inset 0 1px 0 rgba(255, 255, 255, 0.20),
+              inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            overflow: hidden;
+          }
+  # «Месяц», м³: последние 12 месяцев и серые столбцы год назад
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.vid_grafika_vody
+        state: month
+      - condition: state
+        entity: input_boolean.pokazyvat_raskhod_vody_v_rubliakh
+        state_not: 'on'
+    card:
+      type: custom:apexcharts-card
+      header:
+        show: false
+      graph_span: 365d
+      span:
+        end: month
+      series:
+        - entity: sensor.voda_saures_raskhod
+          name: Расход
+          type: column
+          unit: м³
+          float_precision: 2
+          color: '#38bdf8'
+          statistics:
+            type: change
+            period: month
+        - entity: sensor.voda_saures_raskhod
+          name: Год назад
+          type: column
+          unit: м³
+          float_precision: 2
+          offset: -365d
+          color: '#9e9e9e'
+          opacity: 0.5
+          statistics:
+            type: change
+            period: month
+      apex_config:
+        noData:
+          text: 'Вода по месяцам: нет данных синхронизации'
+        chart:
+          height: 160
+          toolbar:
+            show: false
+        tooltip:
+          x:
+            format: MMMM yyyy
+        xaxis:
+          type: datetime
+          labels:
+            format: MMM yy
+            style:
+              colors: 'rgba(255, 255, 255, 0.65)'
+              fontSize: '11px'
+        yaxis:
+          - decimalsInFloat: 1
+        grid:
+          show: false
+        legend:
+          show: false
+        dataLabels:
+          enabled: false
+        plotOptions:
+          bar:
+            columnWidth: 60%
+      card_mod:
+        style: |
+          ha-card {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+            border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+            border-radius: 14px;
+            margin: 3px 6px !important;
+            box-shadow:
+              0 5.5px 11px rgba(0, 0, 0, 0.35),
+              0 1.5px 3px rgba(0, 0, 0, 0.28),
+              inset 0 1px 0 rgba(255, 255, 255, 0.20),
+              inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            overflow: hidden;
+          }
+  # «Месяц», ₽: год назад тоже
+  - type: conditional
+    conditions:
+      - condition: state
+        entity: input_select.vid_grafika_vody
+        state: month
+      - condition: state
+        entity: input_boolean.pokazyvat_raskhod_vody_v_rubliakh
+        state: 'on'
+    card:
+      type: custom:apexcharts-card
+      header:
+        show: false
+      graph_span: 365d
+      span:
+        end: month
+      series:
+        - entity: sensor.voda_saures_stoimost
+          name: Расход
+          type: column
+          unit: ₽
+          float_precision: 0
+          color: '#38bdf8'
+          statistics:
+            type: change
+            period: month
+        - entity: sensor.voda_saures_stoimost
+          name: Год назад
+          type: column
+          unit: ₽
+          float_precision: 0
+          offset: -365d
+          color: '#9e9e9e'
+          opacity: 0.5
+          statistics:
+            type: change
+            period: month
+      apex_config:
+        noData:
+          text: '₽ по месяцам: нет данных синхронизации'
+        chart:
+          height: 160
+          toolbar:
+            show: false
+        tooltip:
+          x:
+            format: MMMM yyyy
+        xaxis:
+          type: datetime
+          labels:
+            format: MMM yy
+            style:
+              colors: 'rgba(255, 255, 255, 0.65)'
+              fontSize: '11px'
+        yaxis:
+          - decimalsInFloat: 0
+        grid:
+          show: false
+        legend:
+          show: false
+        dataLabels:
+          enabled: false
+        plotOptions:
+          bar:
+            columnWidth: 60%
+      card_mod:
+        style: |
+          ha-card {
+            background: linear-gradient(180deg, rgba(255, 255, 255, 0.10), rgba(255, 255, 255, 0.04)) !important;
+            border: 1.5px solid rgba(255, 255, 255, 0.16) !important;
+            border-radius: 14px;
+            margin: 3px 6px !important;
+            box-shadow:
+              0 5.5px 11px rgba(0, 0, 0, 0.35),
+              0 1.5px 3px rgba(0, 0, 0, 0.28),
+              inset 0 1px 0 rgba(255, 255, 255, 0.20),
+              inset 0 -1.5px 3px rgba(0, 0, 0, 0.18) !important;
+            overflow: hidden;
+          }
+card_mod:
+  style: |
+    ha-card {
+      padding: 4px 0;
+      border: 1px solid rgba(255, 255, 255, 0.14);
+      border-radius: 18px;
+      overflow: visible;
+      box-shadow:
+        0 4px 14px rgba(0, 0, 0, 0.22),
+        inset 0 1px 0 rgba(255, 255, 255, 0.10);
+      transition: box-shadow 0.3s ease;
+    }
+grid_options:
+  rows: auto
+  columns: 12

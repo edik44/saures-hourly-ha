@@ -1,0 +1,902 @@
+# saures-hourly-ha — почасовой расход воды SAURES в статистике Home Assistant (пакет), версия 1.0.0.
+# https://github.com/ (ссылка на репозиторий — в README). Лицензия MIT.
+#
+# Что делает: раз в сутки забирает из API личного кабинета SAURES (api.saures.ru) почасовой журнал счётчика воды и
+# раскладывает расход по настоящим часам в долгосрочную статистику HA (м³ и ₽). Перерыв связи контроллера не портит
+# дни: контроллер хранит почасовой журнал, и после связи каждый час ложится на своё место. Плюс сенсоры для карточки
+# (показание, вчера, за месяц, батарея, сигнал, время связи, статус) и уведомление, если связи нет больше 2 суток.
+#
+# Нужно: Home Assistant 2026.x; интеграция Import Statistics (HACS, klausj1/homeassistant-statistics, версия 5.3+);
+# для карточки — Mushroom 5+, ApexCharts card, vertical-stack-in-card, card_mod (HACS, «Интерфейс»).
+#
+# Установка (подробно — README):
+#   1. В /config/secrets.yaml:
+#        saures_email: "логин личного кабинета SAURES (email)"
+#        saures_password: "пароль личного кабинета SAURES"
+#   2. В configuration.yaml (если пакеты ещё не подключены):
+#        homeassistant:
+#          packages: !include_dir_named packages
+#   3. Этот файл — в /config/packages/saures.yaml целиком; настройки — в блоке «НАСТРОЙКИ» скрипта
+#      saures_sinhronizatsiia ниже (по умолчанию всё определяется само).
+#   4. Инструменты разработчика -> YAML -> «Проверить конфигурацию» -> «Перезапустить».
+#   5. Через 2 минуты после запуска автоматизация загрузит всю историю (около минуты); итог — в сенсоре
+#      «Вода SAURES статус» (sensor.voda_saures_status), должно начинаться с «ok».
+#   6. Тариф: помощник «Тариф воды» (₽ за м³). Карточка — dashboards/saures_water_card.yaml.
+#
+# Правила API SAURES: один вход на запуск, паузы 3 с между запросами, запуск не чаще раза в 5 минут (иначе сервер
+# блокирует адрес на минуту). Данные у контроллера появляются раз в сутки, поэтому опрос тоже раз в сутки
+# (+ запасные проверки, если данных долго нет).
+#
+# Как устроено:
+#   - script.saures_sinhronizatsiia — вход, объект и часовой пояс (user/objects), контроллер и счётчик (object/meters);
+#     если контроллер выходил на связь после прошлой загрузки — расход по часам за новые часы (и за 2 дня до прошлой
+#     загрузки) в статистику сенсоров-носителей sensor.voda_saures_raskhod (м³) и sensor.voda_saures_stoimost (₽)
+#     через import_statistics.import_from_json (абсолютные суммы: повторная загрузка тех же часов их перезаписывает).
+#   - script.saures_istoriia — вся история: по дням с даты начала и по часам за последние 35 дней.
+#   - script.saures_itogi — «вчера» и «за месяц» (м³ и ₽) из той же статистики, чтобы совпадали со столбцами.
+#   - script.saures_uvedomlenie — куда слать уведомления о связи (по умолчанию — уведомление в интерфейсе HA).
+#   - script.saures_proverka — отчёт для настройки: объекты, контроллеры, счётчики (id), расход за последние дни.
+#   - Носители статистики — сенсоры без state_class, их состояние — время данных (не число): HA не пишет в их
+#     статистику свои записи, а ApexCharts card их видит (ей нужна существующая сущность). Единицы у их статистики
+#     нет (Import Statistics принимает только единицу самого сенсора); м³ и ₽ подписывает карточка.
+#   - Автоматизации: проверка в 23:45, запасные в 05:45, 11:45, 17:45 и при запуске HA — только если данных нет больше
+#     20 часов; в 00:05 — пересчёт «вчера» и «за месяц» без запросов к SAURES; уведомление, если связи нет 2 суток.
+#
+# Тарифы (₽ за м³): текущий — помощники «Тариф воды» и «Тариф воды действует с» (дата; пусто — цена действует для
+# всей истории). Прошлые — таблица tarify_tablica в блоке «НАСТРОЙКИ». Цена часа — тариф с самой поздней датой
+# начала, не позже этого часа (часы раньше самого раннего тарифа — по самому раннему). При смене тарифа прежнюю цену
+# допишите в таблицу (нужно для полной перезагрузки истории). Если тариф поменяли задним числом — ручной запуск
+# синхронизации с полем dni пересчитает рубли за последние дни.
+#
+# Внимание: с одной учётки SAURES можно запускать только одну такую синхронизацию (иначе общий лимит запросов).
+
+script:
+  saures_sinhronizatsiia:
+    alias: SAURES синхронизация воды
+    description: >-
+      Вход в API SAURES, показание и состояние контроллера; если контроллер выходил на связь после прошлой загрузки —
+      расход по часам в статистику (м³ и ₽) и итоги «вчера» и «за месяц». Ручной запуск — когда угодно, но не чаще раза
+      в 5 минут. Поля: dni — загрузить заново последние N дней; vsia_istoriia — вся история заново.
+    icon: mdi:cloud-sync-outline
+    mode: single
+    max_exceeded: silent
+    fields:
+      dni:
+        name: Загрузить заново, дней
+        description: Обычно не нужно. Перезагрузить последние N дней по часам (например, после смены тарифа задним числом).
+        required: false
+        example: "7"
+        selector:
+          number:
+            min: 1
+            max: 30
+            mode: box
+      vsia_istoriia:
+        name: Вся история заново
+        description: Первый запуск или если что-то пошло не так. Займёт около минуты.
+        required: false
+        selector:
+          # Пусто, не {}: при слиянии пакета HA выбрасывает пустые словари, и селектор оказался бы пустым
+          boolean:
+    sequence:
+      - variables:
+          # >>> НАСТРОЙКИ ------------------------------------------------------------------------------------------
+          obekt_id: 0                 # 0 — первый объект в кабинете SAURES; иначе его id (отчёт «SAURES проверка API»)
+          schetchik_id: 0             # 0 — первый счётчик холодной воды объекта (нет — первый счётчик воды); иначе meter_id
+          istoriia_s: ""              # с какого дня грузить историю, "ГГГГ-ММ-ДД"; пусто — за последние 2 года
+          tarify_tablica: []          # прошлые тарифы, ₽ за м³: [["ГГГГ-ММ-ДД", цена], ...] — дата начала действия
+          # <<< НАСТРОЙКИ ------------------------------------------------------------------------------------------
+          # тарифы: таблица + текущий из помощников (без даты — для всей истории); цена часа — последний по дате начала
+          tarify: >-
+            {% set s = states('input_datetime.tarif_vody_s') %}
+            {% set v = states('input_number.tarif_vody') | float(0) %}
+            {% set s = s if s | regex_match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$') else '1970-01-01' %}
+            {{ ((tarify_tablica + [[s, v]]) if v > 0 else tarify_tablica) | sort }}
+          istoriia_nachalo: >-
+            {{ istoriia_s if istoriia_s | regex_match('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+              else (now() - timedelta(days=730)).strftime('%Y-%m-01') }}
+          ruchnoi_dni: "{{ dni | default(0) | int(0) }}"
+          vsia: "{{ vsia_istoriia | default(false) | bool(false) }}"
+          rano: >-
+            {% set p = as_timestamp(state_attr('sensor.voda_saures_status', 'proverka'), 0) %}
+            {{ p > 0 and as_timestamp(now()) - p < 300 }}
+      - if:
+          - condition: template
+            value_template: "{{ rano }}"
+        then:
+          - stop: Синхронизация была меньше 5 минут назад — пропуск (правила SAURES)
+      - action: rest_command.saures_login
+        data:
+          email: !secret saures_email
+          password: !secret saures_password
+        response_variable: login
+      - variables:
+          sid: >-
+            {{ login.content.data.sid if (login.status == 200 and login.content is mapping
+                and login.content.get('status') == 'ok') else '' }}
+      - if:
+          - condition: template
+            value_template: "{{ sid == '' }}"
+        then:
+          - event: saures_voda
+            event_data:
+              status: >-
+                ошибка входа: HTTP {{ login.status }}
+                {{ login.content.get('errors') if login.content is mapping else (login.content | string)[:120] }}
+              proverka: "{{ now().isoformat() }}"
+          - stop: Вход в API SAURES не удался
+      - delay:
+          seconds: 3
+      # объект и его часовой пояс: время в API — по часам объекта
+      - action: rest_command.saures_get
+        data:
+          path: user/objects
+          query: "sid={{ sid }}"
+        response_variable: obekty
+      - variables:
+          obekt: >-
+            {% set d = obekty.content.get('data') if obekty.content is mapping else none %}
+            {% set spisok = d.get('objects', []) if d is mapping else [] %}
+            {% set ns = namespace(o=none) %}
+            {% for o in spisok %}
+            {% if ns.o is none and (obekt_id | int(0) == 0 or o.get('id') | int(0) == obekt_id | int(0)) %}{% set ns.o = o %}{% endif %}
+            {% endfor %}
+            {{ ns.o }}
+          utc: "{{ (obekt.get('utc') or '') if obekt is mapping else '' }}"
+      - if:
+          - condition: template
+            value_template: "{{ obekt is not mapping or not (utc | regex_match('^[+-][0-9]{2}:00$')) }}"
+        then:
+          - event: saures_voda
+            event_data:
+              status: >-
+                {% if obekt is not mapping %}объект {{ obekt_id }} не найден: HTTP {{ obekty.status }}
+                {{ obekty.content.get('errors') if obekty.content is mapping else '' }}{% else %}часовой пояс объекта
+                «{{ utc }}» не поддерживается (нужен целый час, например +03:00){% endif %}
+              proverka: "{{ now().isoformat() }}"
+          - stop: Объект или его часовой пояс не найдены
+      - variables:
+          sdvig_s: "{{ (utc[1:3] | int) * 3600 * (1 if utc[0] == '+' else -1) }}"
+          sdvig_iso: "{{ utc }}"
+          tz_saures: "Etc/GMT{{ '-' if utc[0] == '+' else '+' }}{{ utc[1:3] | int }}"
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: object/meters
+          query: "sid={{ sid }}&id={{ obekt.get('id') }}"
+        response_variable: meters
+      - variables:
+          meter_id: >-
+            {% set d = meters.content.get('data') if meters.content is mapping else none %}
+            {% set ns = namespace(h=0, v=0, a=0) %}
+            {% for c in (d.get('sensors', []) if d is mapping else []) %}
+            {% for m in c.get('meters', []) %}
+            {% set t = m.get('type') %}
+            {% set tip = ((t.get('name') or '') if t is mapping else (t or '')) | string | lower %}
+            {% set mid = m.get('meter_id') | int(0) %}
+            {% if ns.h == 0 and 'холодн' in tip %}{% set ns.h = mid %}{% endif %}
+            {% if ns.v == 0 and 'вод' in tip %}{% set ns.v = mid %}{% endif %}
+            {% if ns.a == 0 %}{% set ns.a = mid %}{% endif %}
+            {% endfor %}
+            {% endfor %}
+            {{ schetchik_id | int(0) if schetchik_id | int(0) > 0 else (ns.h if ns.h else (ns.v if ns.v else ns.a)) }}
+      - variables:
+          kontroller: >-
+            {% set d = meters.content.get('data') if meters.content is mapping else none %}
+            {% set ns = namespace(c=none) %}
+            {% for c in (d.get('sensors', []) if d is mapping else []) %}
+            {% for m in c.get('meters', []) %}{% if m.get('meter_id') | int(0) == meter_id | int(0) %}{% set ns.c = c %}{% endif %}{% endfor %}
+            {% endfor %}
+            {{ ns.c }}
+          schetchik: >-
+            {% set ns = namespace(m=none) %}
+            {% for m in (kontroller.get('meters', []) if kontroller is mapping else []) %}
+            {% if m.get('meter_id') | int(0) == meter_id | int(0) %}{% set ns.m = m %}{% endif %}
+            {% endfor %}
+            {{ ns.m }}
+      - if:
+          - condition: template
+            value_template: "{{ schetchik is not mapping }}"
+        then:
+          - event: saures_voda
+            event_data:
+              status: >-
+                нет данных счётчика {{ meter_id }}: HTTP {{ meters.status }}
+                {{ meters.content.get('errors') if meters.content is mapping else (meters.content | string)[:120] }}
+              proverka: "{{ now().isoformat() }}"
+          - stop: Нет данных счётчика
+      - variables:
+          dannye_na: "{{ kontroller.get('readout_dt') or kontroller.get('request_dt') or '' }}"
+          sviaz: "{{ kontroller.get('last_connection') or '' }}"
+          t_dannye: "{{ as_timestamp(dannye_na ~ sdvig_iso, 0) if dannye_na else 0 }}"
+          t_zagr: "{{ as_timestamp(states('sensor.voda_saures_raskhod'), 0) }}"
+          rezhim: >-
+            {% if vsia or t_zagr == 0 %}istoriia{% elif ruchnoi_dni > 0 or t_dannye > t_zagr %}okno{% else %}net{% endif %}
+      - event: saures_voda
+        event_data:
+          pokazanie: "{{ (schetchik.get('vals') or [none])[0] }}"
+          batareia: "{{ kontroller.get('bat') }}"
+          signal: "{{ kontroller.get('rssi') }}"
+          sviaz: "{{ sviaz ~ sdvig_iso if sviaz else '' }}"
+      - if:
+          - condition: template
+            value_template: "{{ rezhim == 'net' }}"
+        then:
+          - event: saures_voda
+            event_data:
+              status: >-
+                новых данных нет (последняя связь {{ sviaz[8:10] }}.{{ sviaz[5:7] }} {{ sviaz[11:16] }} по часам объекта)
+              proverka: "{{ now().isoformat() }}"
+          - stop: Новых данных нет
+      - if:
+          - condition: template
+            value_template: "{{ rezhim == 'istoriia' }}"
+        then:
+          - action: script.saures_istoriia
+            data:
+              sid: "{{ sid }}"
+              meter_id: "{{ meter_id }}"
+              sdvig_s: "{{ sdvig_s }}"
+              tz_saures: "{{ tz_saures }}"
+              istoriia_s: "{{ istoriia_nachalo }}"
+              tarify: "{{ tarify }}"
+              dannye_na: "{{ dannye_na ~ sdvig_iso }}"
+          - stop: Загружена вся история
+      - variables:
+          # начало окна — полночь по часам объекта: N дней назад (ручной запуск) или за 2 дня до прошлой загрузки
+          okno_e: >-
+            {% set b = (as_timestamp(now()) - ruchnoi_dni * 86400) if ruchnoi_dni > 0 else (t_zagr - 2 * 86400) %}
+            {{ ((b + sdvig_s) // 86400) * 86400 - sdvig_s }}
+          okno_iso: "{{ (okno_e + sdvig_s) | timestamp_custom('%Y-%m-%dT%H:%M:%S', false) }}"
+          konec_iso: "{{ (as_timestamp(now()) + sdvig_s) | timestamp_custom('%Y-%m-%dT%H:%M:%S', false) }}"
+          baza_s: "{{ (okno_e - 3600) | timestamp_custom('%Y-%m-%d %H:%M:%S') }}"
+          baza_e: "{{ okno_e | timestamp_custom('%Y-%m-%d %H:%M:%S') }}"
+      # суммы на час раньше окна — от них считаются новые суммы
+      - action: recorder.get_statistics
+        data:
+          statistic_ids:
+            - sensor.voda_saures_raskhod
+            - sensor.voda_saures_stoimost
+          start_time: "{{ baza_s }}"
+          end_time: "{{ baza_e }}"
+          period: hour
+          types:
+            - sum
+        response_variable: baza
+      - variables:
+          baza_m3: >-
+            {% set r = baza.get('statistics', {}).get('sensor.voda_saures_raskhod', []) %}
+            {{ r[-1]['sum'] if r | count > 0 and r[-1]['sum'] is not none else none }}
+          baza_rub: >-
+            {% set r = baza.get('statistics', {}).get('sensor.voda_saures_stoimost', []) %}
+            {{ r[-1]['sum'] if r | count > 0 and r[-1]['sum'] is not none else none }}
+      - if:
+          - condition: template
+            value_template: "{{ baza_m3 is none or baza_rub is none }}"
+        then:
+          - action: script.saures_istoriia
+            data:
+              sid: "{{ sid }}"
+              meter_id: "{{ meter_id }}"
+              sdvig_s: "{{ sdvig_s }}"
+              tz_saures: "{{ tz_saures }}"
+              istoriia_s: "{{ istoriia_nachalo }}"
+              tarify: "{{ tarify }}"
+              dannye_na: "{{ dannye_na ~ sdvig_iso }}"
+          - stop: Опорной записи нет — загружена вся история
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: meter/get
+          query: "sid={{ sid }}&id={{ meter_id }}&start={{ okno_iso }}&finish={{ konec_iso }}&group=hour"
+        response_variable: chasy
+      - variables:
+          tochki: >-
+            {% set d = chasy.content.get('data') if chasy.content is mapping else none %}
+            {{ d.get('points', []) if d is mapping else [] }}
+          stroki_m3: >-
+            {% set ns = namespace(s=baza_m3 | float(0), out=[]) %}
+            {% for p in tochki %}
+            {% set dt = p.get('datetime', '') | string %}
+            {% set ns.s = ns.s + ((p.get('vals') or [0])[0] | float(0)) %}
+            {% set ns.out = ns.out + [{'datetime': dt[8:10] ~ '.' ~ dt[5:7] ~ '.' ~ dt[0:4] ~ ' ' ~ dt[11:16],
+                'sum': ns.s | round(3), 'state': ns.s | round(3)}] %}
+            {% endfor %}
+            {{ ns.out }}
+          stroki_rub: >-
+            {% set ns = namespace(s=baza_rub | float(0), out=[]) %}
+            {% for p in tochki %}
+            {% set dt = p.get('datetime', '') | string %}
+            {% set t = namespace(c=(tarify[0][1] if tarify | count > 0 else 0)) %}
+            {% for tr in tarify %}{% if tr[0] <= dt[0:10] %}{% set t.c = tr[1] %}{% endif %}{% endfor %}
+            {% set ns.s = ns.s + ((p.get('vals') or [0])[0] | float(0)) * t.c %}
+            {% set ns.out = ns.out + [{'datetime': dt[8:10] ~ '.' ~ dt[5:7] ~ '.' ~ dt[0:4] ~ ' ' ~ dt[11:16],
+                'sum': ns.s | round(2), 'state': ns.s | round(2)}] %}
+            {% endfor %}
+            {{ ns.out }}
+      - if:
+          - condition: template
+            value_template: "{{ stroki_m3 | count == 0 }}"
+        then:
+          - event: saures_voda
+            event_data:
+              status: >-
+                нет почасовых данных с {{ okno_iso[:10] }}:
+                {{ chasy.content.get('errors') if chasy.content is mapping else 'HTTP ' ~ chasy.status }}
+              proverka: "{{ now().isoformat() }}"
+          - stop: Нет почасовых данных
+      - event: saures_voda
+        event_data:
+          status: >-
+            загрузка {{ stroki_m3 | count }} ч… (если висит долго — смотреть трассировку скрипта)
+      - action: import_statistics.import_from_json
+        data:
+          timezone_identifier: "{{ tz_saures }}"
+          entities:
+            # unit пустая: Import Statistics требует единицу как у сенсора, а у носителей её нет (состояние — время)
+            - id: sensor.voda_saures_raskhod
+              unit: ""
+              values: "{{ stroki_m3 }}"
+            - id: sensor.voda_saures_stoimost
+              unit: ""
+              values: "{{ stroki_rub }}"
+      - event: saures_voda
+        event_data:
+          zagruzheno_do: "{{ dannye_na ~ sdvig_iso }}"
+      - delay:
+          seconds: 15
+      - action: script.saures_itogi
+      - event: saures_voda
+        event_data:
+          status: >-
+            ok: загружено {{ stroki_m3 | count }} ч с {{ okno_iso[8:10] }}.{{ okno_iso[5:7] }},
+            данные на {{ dannye_na[8:10] }}.{{ dannye_na[5:7] }} {{ dannye_na[11:16] }} (часы объекта)
+          proverka: "{{ now().isoformat() }}"
+
+  saures_istoriia:
+    alias: SAURES загрузка всей истории воды
+    description: >-
+      Вся история в статистику: по дням с даты начала и по часам за последние 35 дней, суммы с нуля. Вызывается из
+      «SAURES синхронизация воды» (поле vsia_istoriia или нет опорной записи); сам по себе не запускать — нужен вход (sid).
+    icon: mdi:history
+    mode: single
+    fields:
+      sid:
+        name: Сессия API
+        required: true
+      meter_id:
+        name: Счётчик
+        required: true
+      sdvig_s:
+        name: Сдвиг часов объекта, с
+        required: true
+      tz_saures:
+        name: Пояс объекта
+        required: true
+      istoriia_s:
+        name: История с
+        required: true
+      tarify:
+        name: Тарифы
+        required: true
+      dannye_na:
+        name: Данные на
+        required: true
+    sequence:
+      - variables:
+          sd: "{{ sdvig_s | int }}"
+          granitsa_e: "{{ ((as_timestamp(now()) + sdvig_s | int) // 86400 - 35) * 86400 - sdvig_s | int }}"
+          granitsa_iso: "{{ (granitsa_e + sd) | timestamp_custom('%Y-%m-%dT%H:%M:%S', false) }}"
+          dni_konec_iso: "{{ (granitsa_e + sd - 1) | timestamp_custom('%Y-%m-%dT%H:%M:%S', false) }}"
+          konec_iso: "{{ (as_timestamp(now()) + sd) | timestamp_custom('%Y-%m-%dT%H:%M:%S', false) }}"
+      - event: saures_voda
+        event_data:
+          status: загрузка всей истории…
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: meter/get
+          query: "sid={{ sid }}&id={{ meter_id }}&start={{ istoriia_s }}T00:00:00&finish={{ dni_konec_iso }}&group=day"
+        response_variable: po_dniam
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: meter/get
+          query: "sid={{ sid }}&id={{ meter_id }}&start={{ granitsa_iso }}&finish={{ konec_iso }}&group=hour"
+        response_variable: po_chasam
+      - variables:
+          tochki: >-
+            {% set a = po_dniam.content.get('data') if po_dniam.content is mapping else none %}
+            {% set b = po_chasam.content.get('data') if po_chasam.content is mapping else none %}
+            {{ (a.get('points', []) if a is mapping else []) + (b.get('points', []) if b is mapping else []) }}
+          n_dni: >-
+            {% set a = po_dniam.content.get('data') if po_dniam.content is mapping else none %}
+            {{ (a.get('points', []) if a is mapping else []) | count }}
+          stroki_m3: >-
+            {% set ns = namespace(s=0.0, out=[]) %}
+            {% for p in tochki %}
+            {% set dt = p.get('datetime', '') | string %}
+            {% set ns.s = ns.s + ((p.get('vals') or [0])[0] | float(0)) %}
+            {% set ns.out = ns.out + [{'datetime': dt[8:10] ~ '.' ~ dt[5:7] ~ '.' ~ dt[0:4] ~ ' ' ~ dt[11:16],
+                'sum': ns.s | round(3), 'state': ns.s | round(3)}] %}
+            {% endfor %}
+            {{ ns.out }}
+          stroki_rub: >-
+            {% set ns = namespace(s=0.0, out=[]) %}
+            {% for p in tochki %}
+            {% set dt = p.get('datetime', '') | string %}
+            {% set t = namespace(c=(tarify[0][1] if tarify | count > 0 else 0)) %}
+            {% for tr in tarify %}{% if tr[0] <= dt[0:10] %}{% set t.c = tr[1] %}{% endif %}{% endfor %}
+            {% set ns.s = ns.s + ((p.get('vals') or [0])[0] | float(0)) * t.c %}
+            {% set ns.out = ns.out + [{'datetime': dt[8:10] ~ '.' ~ dt[5:7] ~ '.' ~ dt[0:4] ~ ' ' ~ dt[11:16],
+                'sum': ns.s | round(2), 'state': ns.s | round(2)}] %}
+            {% endfor %}
+            {{ ns.out }}
+      - if:
+          - condition: template
+            value_template: "{{ stroki_m3 | count == 0 }}"
+        then:
+          - event: saures_voda
+            event_data:
+              status: >-
+                история не загружена: по дням
+                {{ po_dniam.content.get('errors') if po_dniam.content is mapping else 'HTTP ' ~ po_dniam.status }},
+                по часам {{ po_chasam.content.get('errors') if po_chasam.content is mapping else 'HTTP ' ~ po_chasam.status }}
+              proverka: "{{ now().isoformat() }}"
+          - stop: История не загружена
+      - action: import_statistics.import_from_json
+        data:
+          timezone_identifier: "{{ tz_saures }}"
+          entities:
+            # unit пустая: Import Statistics требует единицу как у сенсора, а у носителей её нет (состояние — время)
+            - id: sensor.voda_saures_raskhod
+              unit: ""
+              values: "{{ stroki_m3 }}"
+            - id: sensor.voda_saures_stoimost
+              unit: ""
+              values: "{{ stroki_rub }}"
+      - event: saures_voda
+        event_data:
+          zagruzheno_do: "{{ dannye_na }}"
+      - delay:
+          seconds: 15
+      - action: script.saures_itogi
+      - event: saures_voda
+        event_data:
+          status: >-
+            ok: вся история — {{ n_dni }} дн. по дням и {{ stroki_m3 | count - n_dni | int }} ч по часам,
+            всего {{ stroki_m3[-1]['sum'] }} м³ = {{ stroki_rub[-1]['sum'] }} ₽
+          proverka: "{{ now().isoformat() }}"
+
+  saures_itogi:
+    alias: SAURES итоги воды
+    description: >-
+      «Вчера» и «за месяц» (м³ и ₽) из статистики синхронизации — для плиток карточки. Без запросов к SAURES;
+      запускается после загрузки и в 00:05.
+    icon: mdi:sigma
+    mode: single
+    sequence:
+      - action: recorder.get_statistics
+        data:
+          statistic_ids:
+            - sensor.voda_saures_raskhod
+            - sensor.voda_saures_stoimost
+          start_time: "{{ (today_at() - timedelta(days=1)).strftime('%Y-%m-%d %H:%M:%S') }}"
+          end_time: "{{ today_at().strftime('%Y-%m-%d %H:%M:%S') }}"
+          period: day
+          types:
+            - change
+        response_variable: vchera
+      - action: recorder.get_statistics
+        data:
+          statistic_ids:
+            - sensor.voda_saures_raskhod
+            - sensor.voda_saures_stoimost
+          start_time: "{{ today_at().replace(day=1).strftime('%Y-%m-%d %H:%M:%S') }}"
+          period: month
+          types:
+            - change
+        response_variable: mesiats
+      - event: saures_voda
+        event_data:
+          vchera_m3: >-
+            {% set r = vchera.get('statistics', {}).get('sensor.voda_saures_raskhod', []) %}
+            {{ (r[0]['change'] | float(0)) | round(3) if r | count > 0 else 0 }}
+          vchera_rub: >-
+            {% set r = vchera.get('statistics', {}).get('sensor.voda_saures_stoimost', []) %}
+            {{ (r[0]['change'] | float(0)) | round(2) if r | count > 0 else 0 }}
+          mesiats_m3: >-
+            {% set r = mesiats.get('statistics', {}).get('sensor.voda_saures_raskhod', []) %}
+            {{ (r[-1]['change'] | float(0)) | round(3) if r | count > 0 else 0 }}
+          mesiats_rub: >-
+            {% set r = mesiats.get('statistics', {}).get('sensor.voda_saures_stoimost', []) %}
+            {{ (r[-1]['change'] | float(0)) | round(2) if r | count > 0 else 0 }}
+
+  saures_uvedomlenie:
+    alias: SAURES уведомление
+    description: >-
+      Куда отправлять уведомления о связи контроллера (вызывает автоматизация «Вода SAURES — нет связи 2 суток»).
+      По умолчанию — уведомление в интерфейсе HA; добавьте свои действия (телефон, почта) в блок «УВЕДОМЛЕНИЯ».
+    icon: mdi:message-alert-outline
+    mode: queued
+    fields:
+      zagolovok:
+        name: Заголовок
+        required: true
+        selector:
+          text:
+      tekst:
+        name: Текст
+        required: true
+        selector:
+          text:
+            multiline: true
+    sequence:
+      # >>> УВЕДОМЛЕНИЯ ------------------------------------------------------------------------------------------
+      - action: persistent_notification.create
+        data:
+          title: "{{ zagolovok }}"
+          message: "{{ tekst }}"
+          notification_id: saures_sviaz
+      # Пример — на телефон с приложением Home Assistant (имя действия — в Инструменты разработчика -> Действия):
+      # - action: notify.mobile_app_moi_telefon
+      #   data:
+      #     title: "{{ zagolovok }}"
+      #     message: "{{ tekst }}"
+      # <<< УВЕДОМЛЕНИЯ ------------------------------------------------------------------------------------------
+
+  saures_proverka:
+    alias: SAURES проверка API
+    description: >-
+      Вход в API SAURES и краткий отчёт для настройки: объекты (id, часовой пояс), контроллеры (батарея, сигнал, время
+      связи), счётчики (meter_id, тип, показание), расход по дням за 4 дня и по часам за 2 дня. Адреса, номеров счетов,
+      пароля и сессии в отчёте нет. Запуск: Инструменты разработчика -> Действия -> «SAURES проверка API».
+    icon: mdi:api
+    mode: single
+    sequence:
+      - action: rest_command.saures_login
+        data:
+          email: !secret saures_email
+          password: !secret saures_password
+        response_variable: login
+      - if:
+          - condition: template
+            value_template: >-
+              {{ not (login.status == 200 and login.content is mapping and login.content.get('status') == 'ok') }}
+        then:
+          - variables:
+              report:
+                vhod: ошибка
+                http: "{{ login.status }}"
+                otvet: >-
+                  {{ login.content.get('errors') if login.content is mapping else (login.content | string)[:300] }}
+          - stop: Вход в API SAURES не удался
+            response_variable: report
+      - variables:
+          sid: "{{ login.content.data.sid }}"
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: user/objects
+          query: "sid={{ sid }}"
+        response_variable: objects
+      - variables:
+          obj_list: >-
+            {% set d = objects.content.get('data') if objects.content is mapping else none %}
+            {% if d is mapping and d.get('objects') is not none %}{{ d.objects }}{% elif d is iterable and d is not string and d is not mapping %}{{ d }}{% else %}{{ [] }}{% endif %}
+          obj_id: "{{ obj_list[0].id if obj_list | count > 0 else 0 }}"
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: object/meters
+          query: "sid={{ sid }}&id={{ obj_id }}"
+        response_variable: meters
+      - variables:
+          ctrls: >-
+            {% set d = meters.content.get('data') if meters.content is mapping else none %}
+            {{ d.sensors if d is mapping and d.get('sensors') is not none else [] }}
+          meter_id: >-
+            {% set ns = namespace(id=0) %}
+            {% for c in ctrls %}{% for m in c.get('meters', []) %}{% if ns.id == 0 %}{% set ns.id = m.get('meter_id', 0) %}{% endif %}{% endfor %}{% endfor %}
+            {{ ns.id }}
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: meter/get
+          query: >-
+            sid={{ sid }}&id={{ meter_id }}&start={{ (now() - timedelta(days=4)).strftime('%Y-%m-%dT00:00:00') }}&finish={{ now().strftime('%Y-%m-%dT23:59:59') }}&group=day
+        response_variable: po_dniam
+      - delay:
+          seconds: 3
+      - action: rest_command.saures_get
+        data:
+          path: meter/get
+          query: >-
+            sid={{ sid }}&id={{ meter_id }}&start={{ (now() - timedelta(days=2)).strftime('%Y-%m-%dT00:00:00') }}&finish={{ now().strftime('%Y-%m-%dT23:59:59') }}&group=hour
+        response_variable: po_chasam
+      - variables:
+          report: >-
+            {% set ns = namespace(objs=[], ctrl=[], days=[], hours=[]) %}
+            {% for o in obj_list %}{% set ns.objs = ns.objs + [{'id': o.get('id'), 'tip': o.get('label'), 'utc': o.get('utc')}] %}{% endfor %}
+            {% for c in ctrls %}
+            {% set ms = namespace(l=[]) %}
+            {% for m in c.get('meters', []) %}
+            {% set ms.l = ms.l + [{'meter_id': m.get('meter_id'), 'imia': m.get('meter_name'), 'tip': (m.get('type').get('name') if m.get('type') is mapping else m.get('type')), 'ed': m.get('unit'), 'pokazanie': m.get('vals'), 'sostoianie': (m.get('state').get('name') if m.get('state') is mapping else m.get('state'))}] %}
+            {% endfor %}
+            {% set ns.ctrl = ns.ctrl + [{'model': c.get('model'), 'proshivka': c.get('firmware'), 'batareia': c.get('bat'), 'signal': c.get('rssi'), 'sviaz': c.get('last_connection'), 'otpravka': c.get('request_dt'), 'dannye_na': c.get('readout_dt'), 'period': c.get('check_period_display'), 'schetchiki': ms.l}] %}
+            {% endfor %}
+            {% set dd = po_dniam.content.get('data') if po_dniam.content is mapping else none %}
+            {% for p in (dd.get('points', []) if dd is mapping else []) %}{% set ns.days = ns.days + [[p.get('datetime'), p.get('vals')]] %}{% endfor %}
+            {% set hh = po_chasam.content.get('data') if po_chasam.content is mapping else none %}
+            {% for p in (hh.get('points', []) if hh is mapping else []) %}{% set ns.hours = ns.hours + [[p.get('datetime'), p.get('vals')]] %}{% endfor %}
+            {{ {'obekty': ns.objs, 'kontrollery': ns.ctrl, 'meter_id': meter_id, 'po_dniam': ns.days, 'po_chasam': ns.hours,
+                'oshibki': [objects.content.get('errors') if objects.content is mapping else objects.status,
+                            meters.content.get('errors') if meters.content is mapping else meters.status,
+                            po_dniam.content.get('errors') if po_dniam.content is mapping else po_dniam.status,
+                            po_chasam.content.get('errors') if po_chasam.content is mapping else po_chasam.status]} }}
+      - stop: Готово
+        response_variable: report
+
+  # >>> СКРИПТ ГРАФИКА ---------------------------------------------------------------------------------------------
+  grafik_vody:
+    alias: График воды
+    description: Карточка «Вода» — показать выбранный вид графика (hour, day, month); повторное нажатие скрывает график
+    icon: mdi:chart-bar
+    mode: single
+    max_exceeded: silent
+    fields:
+      vid:
+        name: Вид графика
+        description: hour, day или month
+        required: true
+        example: day
+        selector:
+          select:
+            options:
+              - hour
+              - day
+              - month
+    sequence:
+      - action: input_select.select_option
+        target:
+          entity_id: input_select.vid_grafika_vody
+        data:
+          option: "{{ 'none' if is_state('input_select.vid_grafika_vody', vid) else vid }}"
+  # <<< СКРИПТ ГРАФИКА ---------------------------------------------------------------------------------------------
+
+rest_command:
+  saures_login:
+    url: https://api.saures.ru/1.0/login
+    method: post
+    content_type: "application/x-www-form-urlencoded"
+    payload: "email={{ email | urlencode }}&password={{ password | urlencode }}"
+    timeout: 20
+  saures_get:
+    url: "https://api.saures.ru/1.0/{{ path }}?{{ query }}"
+    method: get
+    timeout: 60
+
+input_datetime:
+  tarif_vody_s:
+    name: Тариф воды действует с
+    has_date: true
+    has_time: false
+    icon: mdi:calendar-start
+
+# >>> ПОМОЩНИКИ КАРТОЧКИ -------------------------------------------------------------------------------------------
+input_number:
+  tarif_vody:
+    name: Тариф воды
+    min: 0
+    max: 10000
+    step: 0.01
+    mode: box
+    unit_of_measurement: "₽/м³"
+    icon: mdi:cash
+
+input_boolean:
+  pokazyvat_raskhod_vody_v_rubliakh:
+    name: Показывать расход воды в рублях
+    icon: mdi:currency-rub
+
+input_select:
+  vid_grafika_vody:
+    name: Вид графика воды
+    icon: mdi:chart-bar
+    options:
+      - hour
+      - day
+      - month
+      - none
+# <<< ПОМОЩНИКИ КАРТОЧКИ -------------------------------------------------------------------------------------------
+
+template:
+  - trigger:
+      - trigger: event
+        event_type: saures_voda
+    sensor:
+      - name: Вода SAURES показание
+        unique_id: voda_saures_pokazanie
+        unit_of_measurement: "m³"
+        device_class: water
+        icon: mdi:counter
+        state: >-
+          {% set v = trigger.event.data.get('pokazanie') %}
+          {{ v if is_number(v) else (this.state if is_number(this.state) else none) }}
+      - name: Вода SAURES батарея
+        unique_id: voda_saures_batareia
+        unit_of_measurement: "%"
+        device_class: battery
+        state: >-
+          {% set v = trigger.event.data.get('batareia') %}
+          {{ v if is_number(v) else (this.state if is_number(this.state) else none) }}
+      - name: Вода SAURES сигнал
+        unique_id: voda_saures_signal
+        unit_of_measurement: "dBm"
+        device_class: signal_strength
+        state: >-
+          {% set v = trigger.event.data.get('signal') %}
+          {{ v if is_number(v) else (this.state if is_number(this.state) else none) }}
+      - name: Вода SAURES связь
+        unique_id: voda_saures_sviaz
+        device_class: timestamp
+        icon: mdi:wifi-sync
+        state: >-
+          {% set v = trigger.event.data.get('sviaz') %}
+          {{ v if as_datetime(v, none) is not none else (this.state if as_datetime(this.state, none) is not none else none) }}
+      # Носители статистики (её пишет только синхронизация). Состояние — до какого времени загружены данные.
+      - name: Вода SAURES расход
+        unique_id: voda_saures_raskhod
+        device_class: timestamp
+        icon: mdi:water-outline
+        state: >-
+          {% set v = trigger.event.data.get('zagruzheno_do') %}
+          {{ v if as_datetime(v, none) is not none else (this.state if as_datetime(this.state, none) is not none else none) }}
+      - name: Вода SAURES стоимость
+        unique_id: voda_saures_stoimost
+        device_class: timestamp
+        icon: mdi:cash
+        state: >-
+          {% set v = trigger.event.data.get('zagruzheno_do') %}
+          {{ v if as_datetime(v, none) is not none else (this.state if as_datetime(this.state, none) is not none else none) }}
+      - name: Вода SAURES вчера
+        unique_id: voda_saures_vchera
+        unit_of_measurement: "m³"
+        icon: mdi:cup-water
+        state: >-
+          {% set v = trigger.event.data.get('vchera_m3') %}
+          {{ v if is_number(v) else (this.state if is_number(this.state) else none) }}
+      - name: Вода SAURES вчера руб
+        unique_id: voda_saures_vchera_rub
+        unit_of_measurement: "RUB"
+        icon: mdi:cash
+        state: >-
+          {% set v = trigger.event.data.get('vchera_rub') %}
+          {{ v if is_number(v) else (this.state if is_number(this.state) else none) }}
+      - name: Вода SAURES за месяц
+        unique_id: voda_saures_za_mesiats
+        unit_of_measurement: "m³"
+        icon: mdi:calendar-month-outline
+        state: >-
+          {% set v = trigger.event.data.get('mesiats_m3') %}
+          {{ v if is_number(v) else (this.state if is_number(this.state) else none) }}
+      - name: Вода SAURES за месяц руб
+        unique_id: voda_saures_za_mesiats_rub
+        unit_of_measurement: "RUB"
+        icon: mdi:cash-multiple
+        state: >-
+          {% set v = trigger.event.data.get('mesiats_rub') %}
+          {{ v if is_number(v) else (this.state if is_number(this.state) else none) }}
+      - name: Вода SAURES статус
+        unique_id: voda_saures_status
+        icon: mdi:cloud-check-outline
+        state: >-
+          {% set v = trigger.event.data.get('status') %}
+          {{ (v | string)[:250] if v else this.state }}
+        attributes:
+          proverka: >-
+            {% set v = trigger.event.data.get('proverka') %}
+            {{ v if v else this.attributes.get('proverka') }}
+
+automation:
+  - id: saures_voda_sinhronizatsiia
+    alias: Вода SAURES — синхронизация
+    description: >-
+      Проверка данных SAURES в 23:45 (контроллер выходит на связь раз в сутки). Запасные проверки в 05:45, 11:45, 17:45
+      и при запуске HA — только если данных нет больше 20 часов (перерыв связи или контроллер выходит на связь позже).
+      В 00:05 — только пересчёт «вчера» и «за месяц» из статистики, без запросов к SAURES. При первом запуске загрузит
+      всю историю.
+    mode: single
+    triggers:
+      - trigger: time
+        at: "23:45:00"
+        id: osnovnaia
+      - trigger: time
+        at:
+          - "05:45:00"
+          - "11:45:00"
+          - "17:45:00"
+        id: zapasnaia
+      - trigger: homeassistant
+        event: start
+        id: zapusk
+      - trigger: time
+        at: "00:05:00"
+        id: polnoch
+    conditions: []
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: polnoch
+            sequence:
+              - action: script.saures_itogi
+        default:
+          - condition: template
+            value_template: >-
+              {% set z = as_timestamp(states('sensor.voda_saures_raskhod'), 0) %}
+              {{ trigger.id == 'osnovnaia' or as_timestamp(now()) - z > 20 * 3600 }}
+          - if:
+              - condition: trigger
+                id: zapusk
+            then:
+              - delay:
+                  minutes: 2
+          - action: script.saures_sinhronizatsiia
+
+  - id: saures_voda_net_sviazi
+    alias: Вода SAURES — нет связи 2 суток
+    description: >-
+      Контроллер SAURES не выходил на связь больше 48 часов — уведомление (скрипт «SAURES уведомление»); когда связь
+      вернулась после такого перерыва — короткое сообщение. Данные за перерыв не теряются: контроллер хранит почасовой
+      журнал, синхронизация раскладывает его по часам.
+    mode: single
+    triggers:
+      - trigger: template
+        value_template: >-
+          {% set t = as_timestamp(states('sensor.voda_saures_sviaz'), 0) %}
+          {{ t > 0 and as_timestamp(now()) - t > 48 * 3600 }}
+        id: net
+      - trigger: state
+        entity_id: sensor.voda_saures_sviaz
+        to: null
+        id: est
+    conditions:
+      - condition: template
+        value_template: >-
+          {% if trigger.id == 'net' %}true{% else %}
+          {% set a = as_timestamp(trigger.from_state.state, 0) if trigger.from_state else 0 %}
+          {% set b = as_timestamp(trigger.to_state.state, 0) if trigger.to_state else 0 %}
+          {{ a > 0 and b - a > 48 * 3600 }}{% endif %}
+    actions:
+      - choose:
+          - conditions:
+              - condition: trigger
+                id: net
+            sequence:
+              - action: script.saures_uvedomlenie
+                data:
+                  zagolovok: Счётчик воды SAURES без связи
+                  tekst: >-
+                    {{ now().strftime('%d.%m.%Y %H:%M') }}: контроллер SAURES (вода) не выходил на связь больше 2 суток.
+                    Последняя связь {{ as_timestamp(states('sensor.voda_saures_sviaz')) | timestamp_custom('%d.%m.%Y %H:%M') }},
+                    батарея {{ states('sensor.voda_saures_batareia') }}%, сигнал {{ states('sensor.voda_saures_signal') }} dBm.
+                    Проверьте Wi-Fi и контроллер; данные за перерыв загрузятся после связи.
+          - conditions:
+              - condition: trigger
+                id: est
+            sequence:
+              - action: script.saures_uvedomlenie
+                data:
+                  zagolovok: Счётчик воды SAURES снова на связи
+                  tekst: >-
+                    {{ now().strftime('%d.%m.%Y %H:%M') }}: контроллер SAURES снова на связи, перерыв
+                    {{ ((as_timestamp(trigger.to_state.state) - as_timestamp(trigger.from_state.state)) / 86400)
+                    | round(1) }} сут. Данные за перерыв загружаются по часам, столбцы дней будут правильными.
